@@ -1,4 +1,5 @@
-// gcc -O2 -o aio-signal-example aio-signal-example.c
+// linux: gcc -O2 -o aio-signal-example aio-signal-example.c -lrt
+// macOS: gcc -O2 -o aio-signal-example aio-signal-example.c
 
 #include <assert.h>
 #include <errno.h>
@@ -8,7 +9,12 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <aio.h>
+#include <time.h>
+#else
 #include <sys/aio.h>
+#endif
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
@@ -139,9 +145,12 @@ user	0m0,617s
 sys 	0m0,012s
 */
 
-const int io_ready_signal_number = SIGIO;
+
+static const int io_ready_signal_number = SIGIO;
 
 static volatile sig_atomic_t need_to_check_read_event = 1;
+
+static volatile sig_atomic_t passing_sig_val_ptr_works = 0;
 
 static struct {
     long idle_iterations_io_not_ready_count;
@@ -162,7 +171,11 @@ static struct {
 
 long stop_watch_ns() {
     struct timespec time_now= {0};
+#ifdef __linux__
+    clock_gettime(CLOCK_BOOTTIME, &time_now);
+#else
     clock_gettime(CLOCK_REALTIME, &time_now);
+#endif
     return time_now.tv_sec * 1000 * 1000 * 1000 + time_now.tv_nsec;
 }
 
@@ -279,6 +292,8 @@ void print_stats() {
 
     printf("all pread count %ld\n", statistics.synchronous_read_count);
     printf("average time spent for pread %lf ns\n", pread_time);
+
+	printf("passing sig_val works: %s\n", passing_sig_val_ptr_works? "yes": "no");
 }
 
 void aio_notification_handler(__attribute__((unused)) int signal_value, siginfo_t* signal_info, void* context) {
@@ -288,8 +303,10 @@ void aio_notification_handler(__attribute__((unused)) int signal_value, siginfo_
     }
     need_to_check_read_event = 1;
 #ifdef __linux__
-    struct aiocb* aio_request = signal_info->si_addr;
-    assert(aio_request != NULL);
+    if (signal_info->si_pid == getpid() && signal_info->si_code == SI_ASYNCIO) {
+        struct aiocb* aio_request = signal_info->si_value.sival_ptr;
+        passing_sig_val_ptr_works = aio_request != NULL;
+    }
     // do notify some logic to call aio_return on particular aio_request
     // instead of notifiing logic by flag, wich does not know an what aio_request do aio_return
 #endif // __linux__
@@ -413,7 +430,7 @@ int main(int argc, char** argv) {
         read_buffer_max_size = file_system_info.f_bsize;
     }
 
-    printf("reading %s from file %s, size %lld bytes, buffer size %zu bytes\n",
+    printf("reading %s from file %s, size %ld bytes, buffer size %zu bytes\n",
            (is_async? "async": "sync"), file_name, file_stats.st_size, read_buffer_max_size);
 
     struct sigaction signal_settings = { NULL, SA_ONSTACK | SA_RESTART | SA_SIGINFO, SIG_BLOCK };
@@ -430,20 +447,23 @@ int main(int argc, char** argv) {
 
     char *read_buffer = malloc(read_buffer_max_size);
 
-    struct aiocb aio_request = {};
-    aio_request.aio_fildes = file_descriptor;
-    aio_request.aio_offset = 0;
-    aio_request.aio_buf = read_buffer;
-    aio_request.aio_nbytes = read_buffer_max_size; // Length of transfer
-    aio_request.aio_reqprio = 0;
-    aio_request.aio_lio_opcode = LIO_READ; // ignored by `aio_read()`
-    aio_request.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
-    aio_request.aio_sigevent.sigev_signo = io_ready_signal_number;
+
+    struct aiocb *aio_request = malloc(sizeof(struct aiocb));
+    memset(aio_request, 0, sizeof(struct aiocb));
+
+    aio_request->aio_fildes = file_descriptor;
+    aio_request->aio_offset = 0;
+    aio_request->aio_buf = read_buffer;
+    aio_request->aio_nbytes = read_buffer_max_size; // Length of transfer
+    aio_request->aio_reqprio = 0;
+    //aio_request->aio_lio_opcode = LIO_READ; // ignored by `aio_read()`
+    aio_request->aio_sigevent.sigev_notify = SIGEV_SIGNAL;
+    aio_request->aio_sigevent.sigev_signo = io_ready_signal_number;
     // Mac OS X does not support real time signals ([RTS] in the posix specification),
     // which is the section of POSIX which adds userdata pointers to signals.
 
     // on macOS this will not pass a pointer, it will pass a NULL
-    aio_request.aio_sigevent.sigev_value.sival_ptr = &aio_request;
+    aio_request->aio_sigevent.sigev_value.sival_ptr = aio_request;
 
     // kqueue notification by aio is not implemented
     // thread notification by aio (function call) is not implemented
@@ -454,21 +474,22 @@ int main(int argc, char** argv) {
     for (;;) {
         if (is_async) {
             if (need_to_check_read_event) {
-                if (asynchronous_read(&aio_request, do_output)) {
+                if (asynchronous_read(aio_request, do_output)) {
                     break;
                 }
             } else {
                 statistics.idle_iteration_without_event++;
             }
         } else {
-            if (synchronous_read(&aio_request, do_output)) {
+            if (synchronous_read(aio_request, do_output)) {
                 break;
             }
         }
     }
 
-    close(file_descriptor);
     free(read_buffer);
+    free(aio_request);
+    close(file_descriptor);
 
     print_stats();
 }
