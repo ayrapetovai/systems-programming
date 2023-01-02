@@ -152,7 +152,11 @@ static volatile sig_atomic_t need_to_check_read_event = 1;
 
 static volatile sig_atomic_t passing_sig_val_ptr_works = 0;
 
+static volatile sig_atomic_t file_descriptor = -1;
+
 static struct {
+    long program_start_time_ns;
+
     long idle_iterations_io_not_ready_count;
     long idle_iteration_without_event;
 
@@ -294,6 +298,7 @@ void print_stats() {
     printf("average time spent for pread %lf ns\n", pread_time);
 
 	printf("passing sig_val works: %s\n", passing_sig_val_ptr_works? "yes": "no");
+    printf("took %ld ns\n", end_watch_ns(statistics.program_start_time_ns));
 }
 
 void aio_notification_handler(__attribute__((unused)) int signal_value, siginfo_t* signal_info, void* context) {
@@ -302,14 +307,16 @@ void aio_notification_handler(__attribute__((unused)) int signal_value, siginfo_
         exit(1);
     }
     need_to_check_read_event = 1;
-#ifdef __linux__
-    if (signal_info->si_pid == getpid() && signal_info->si_code == SI_ASYNCIO) {
+
+    // if (signal_info->si_pid == getpid() && signal_info->si_code == SI_ASYNCIO) {
+    if (signal_info != NULL && signal_info->si_value.sival_ptr != NULL) {
         struct aiocb* aio_request = signal_info->si_value.sival_ptr;
-        passing_sig_val_ptr_works = aio_request != NULL;
+        if (aio_request != NULL) {
+            passing_sig_val_ptr_works = aio_request->aio_fildes == file_descriptor;
+        }
     }
     // do notify some logic to call aio_return on particular aio_request
     // instead of notifiing logic by flag, wich does not know an what aio_request do aio_return
-#endif // __linux__
 }
 
 void interrupt_signal_handler(int signal_value) {
@@ -346,6 +353,8 @@ void print_help(const char* program_name_raw) {
 }
 
 int main(int argc, char** argv) {
+    statistics.program_start_time_ns = stop_watch_ns();
+
     char is_async = 1;
     char do_output = 0;
     size_t read_buffer_max_size = -1;
@@ -418,7 +427,7 @@ int main(int argc, char** argv) {
         exit(1);
     }
 
-    int file_descriptor = open(file_name, O_RDONLY);
+    file_descriptor = open(file_name, O_RDONLY);
     assert(file_descriptor != -1);
 
     if (read_buffer_max_size == -1) {
@@ -446,7 +455,6 @@ int main(int argc, char** argv) {
     }
 
     char *read_buffer = malloc(read_buffer_max_size);
-
 
     struct aiocb *aio_request = malloc(sizeof(struct aiocb));
     memset(aio_request, 0, sizeof(struct aiocb));
